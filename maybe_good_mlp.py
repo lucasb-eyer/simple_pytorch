@@ -63,6 +63,7 @@ class MyMLP(nn.Module):
 
 def printmem(name, rank=0):
     torch.cuda.synchronize()
+    distr.barrier()
     if rank == 0:
         print(f"Mem {name}: {torch.cuda.max_memory_allocated() / 1024**2:.2f}MiB", flush=True)
 
