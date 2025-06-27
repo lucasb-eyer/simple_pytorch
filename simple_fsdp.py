@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# From: https://github.com/pytorch/torchtitan/blob/main/torchtitan/experiments/simple_fsdp/simple_fsdp.py
+# This file is exactly on commit 8850c5a:
+# https://github.com/pytorch/torchtitan/blob/main/torchtitan/experiments/simple_fsdp/simple_fsdp.py
 
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -137,7 +138,9 @@ def _register_parametrization(
     get_model_state_dict func in torchtitan's torchtitan/components/checkpoint.py.
     """
     param_name_to_property = {
-        param_name: property(lambda self, pn=param_name: parametrization(self._parameters[pn]))
+        param_name: property(
+            lambda self, pn=param_name: parametrization(self._parameters[pn])
+        )
         for param_name in param_names
     }
     module_cls = type(

@@ -2,53 +2,63 @@
 
 First step is getting simple_fsdp to work outside of torchtitan. I'm failing, pls help??
 
-Running:
+# First tests
 
-```
-env CUDA_VISIBLE_DEVICES=1 torchrun --nproc-per-node=gpu main.py
-```
+This is with a big fat MLP, trying to understand which combination of things
+have which effect. Code in speed_mem_tests_mlp.py.
 
-Gives:
+### Baseline: seqlen=1024, model=1024 3xMLP
 
-```
-['cudagraphs', 'inductor', 'onnxrt']
-First linear weights:  tensor([ 2.4542e-02,  2.5251e-02, -1.9412e-03,  ..., -6.2052e-05,
-        -1.4805e-02, -2.7190e-02], device='cuda:0',
-       grad_fn=<_ToTorchTensorBackward>)
-[rank0]: Traceback (most recent call last):
-[rank0]:   File "/root/main.py", line 115, in <module>
-[rank0]:     main()
-[rank0]:   File "/root/main.py", line 94, in main
-[rank0]:     logits = model(data)
-[rank0]:              ^^^^^^^^^^^
-[rank0]:   File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-[rank0]:     return self._call_impl(*args, **kwargs)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-[rank0]:     return forward_call(*args, **kwargs)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/root/main.py", line 41, in forward
-[rank0]:     x = blk(x)
-[rank0]:         ^^^^^^
-[rank0]:   File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-[rank0]:     return self._call_impl(*args, **kwargs)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-[rank0]:     return forward_call(*args, **kwargs)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/root/main.py", line 24, in forward
-[rank0]:     y = self.l1(x)
-[rank0]:         ^^^^^^^^^^
-[rank0]:   File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-[rank0]:     return self._call_impl(*args, **kwargs)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-[rank0]:     return forward_call(*args, **kwargs)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/linear.py", line 125, in forward
-[rank0]:     return F.linear(input, self.weight, self.bias)
-[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]: RuntimeError: mat2 must be a matrix, got 1-D tensor
-```
+| what? | init MiB | pre-step0 MiB | peak MiB | steptime ms |
+|-------|----------|---------------|----------|-------------|
+| Nothing                      | 348 |  -  | 5985 | 355/340 |
+| . | . | . | . | . |
+| +autocast(bf16)              | 348 |  -  | 2211 | 63 |
+| . | . | . | . | . |
+| +data_parallel               | 348 | 432 | 5513 | 844 |
+| +compile(model)              | 348 | 432 | 3347 | 1018 |
+| +ac_mode="full"              | 348 | 432 | 3347 | 850 |
+| +compile(step_fn)            | 348 | 432 | 2638 | 825 |
+| +compile(_fwd)+compile(_bwd) | 348 | 432 | 2638 | 780 |
+| +param=fp32,reduce=bf16      | 348 | 432 | 2638 | 651 |
+| +param=bf16,reduce=fp32      | 348 | 432 | 1502 | 429 |
+| +param=bf16,reduce=bf16      | 348 | 432 | 1502 | 294 |
 
-Note that the weights of the first linear lost a dimension!? The same happens with `replicate` btw.
+### On 4xA100 SXM, seqlen=4096, model=4096 4xMLP
+
+|          what?               | init MiB | pre-step0 MiB | peak MiB | steptime ms |
+|------------------------------|----------|---------------|----------|-------------|
+| Nothing                      |   3072   |      -        | 40_977   | 7020        |
+| . | . | . | . | . |
+| autocast (bf16)              |   3072   |      -        | 30_737   | 600         |
+| compile (_fwd + _bwd)        |   3072   |      -        | 33_297   | 6978        |
+| both                         |   3072   |      -        | 22_801   | 565         |
+| . | . | . | . | . |
+| data_parallel                |   3072   |    3200       | 36_625   | 7169        |
+| +compile(2x)                 |   3072   |    3200       | 26_896   | 7141        |
+| +ac_mode=full + compile(2x)  |   3072   |    3200       | 28_944   | 7118        |
+| +param=bf16,reduce=bf16      |   3072   |    3200       | 15_633   | 566         |
+| . | . | . | . | . |
+| +compile(model, options)     |   3072   |    3200       | 8448     | 590         |
+| +compile(model)              |   3072   |    3200       | 19_473   | 575         |
+
+Let's dig into compile options:
+| no option     | 19_473 | 575 |
+| epifusion     | 19_473 | 569 |
+| shape-padding | 19_473 | 568 |
+| autotune      | 19_473 | 590 |
+| cudagraph     |   8448 | 572 |
+| cg+epi+pad    |   8448 | 573 |
+
+Some weird observations:
+- with `compile(model, cudagraph)` has median 8448, but actually first step 19k, second step 21k!
+- with `compile(model)` has consistent 21k (after first step 19k)
+- with `compile(2x)` without cudagraph, getting 15k consistently, and fastest too!
+
+### Meta init
+
+With 4 GPUs:
+- Without: 3072 after Model(), 3200 after data_parallel(model), 15633 peak, 559ms
+- With: 0 after Model() and data_parallel, 768 after to_empty, 1088 after init_weights, 15633 peak, 496ms
+
+Seems to work, almost.
