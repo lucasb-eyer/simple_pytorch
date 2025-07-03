@@ -62,3 +62,14 @@ With 4 GPUs:
 - With: 0 after Model() and data_parallel, 768 after to_empty, 1088 after init_weights, 15633 peak, 496ms
 
 Seems to work, almost.
+
+
+# Nsight systems:
+
+(url from https://developer.nvidia.com/nsight-systems/get-started)
+
+```
+wget https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2025_3/NsightSystems-linux-public-2025.3.1.90-3582212.run
+chmod +x nsight-systems-*.run
+sudo ./nsight-systems-*.run
+```

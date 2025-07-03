@@ -104,7 +104,7 @@ def main(rank, local_rank, world_size):
     # Should all just be garbage memory (likely but not certainly zero)
     for name, param in model.named_parameters():
         if "bias" in name: continue  # Just for brevity, skip.
-        print(f"[STATS {rank}] {name}: {param.norm().item():.5f}")
+        print(f"[STATS {rank}] {name}: {param.norm().full_tensor().item():.5f}")
 
     # Run user-defined initializers
     with torch.no_grad():
@@ -114,7 +114,7 @@ def main(rank, local_rank, world_size):
 
     for name, param in model.named_parameters():
         if "bias" in name: continue  # Just for brevity, skip.
-        print(f"[STATS {rank}] {name}: {param.norm().item():.5f}")
+        print(f"[STATS {rank}] {name}: {param.norm().full_tensor().item():.5f}")
 
     # NOTE: I've seen this in torchtitan, but it doesn't have any effect for me yet
     torch._inductor.config.reorder_for_peak_memory = False  # Seen https://github.com/pytorch/torchtitan/blob/d9cc6b4df341eec27768b5ab9cead87ef595dbc2/torchtitan/experiments/simple_fsdp/parallelize.py#L96
@@ -152,7 +152,7 @@ def main(rank, local_rank, world_size):
         print(f"[{rank}] step {step}: loss {loss.item():.2f}")  # Causes a transfer.
 
         for name, param in model.named_parameters():
-            print(f"[STATS {rank}] {name}: {param.norm().item():.5f} {param.grad.norm().item():.5f}")
+            print(f"[STATS {rank}] {name}: {param.norm().full_tensor().item():.5f} {param.grad.norm().full_tensor().item():.5f}")
 
         torch.cuda.synchronize()
         step_times.append((time.perf_counter() - t0) * 1000)  # ms
