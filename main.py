@@ -24,6 +24,11 @@ import torch.cuda.nvtx as nvtx
 import simple_fsdp
 
 
+# start from the beginning to track every gpu memory allocation
+# otherwise we lost cpp tracestack for model initialization
+torch.cuda.memory._record_memory_history(max_entries=10000000)
+
+
 class Attention(nn.Module):
     def __init__(self, dim, head_dim, kv_reduce=1):
         super().__init__()
@@ -279,7 +284,6 @@ def main(args, rank, local_rank, world_size):
         if step == 2:
             torch.cuda.cudart().cudaProfilerStart()
             prof.start()
-            torch.cuda.memory._record_memory_history(max_entries=100000)
 
         model.zero_grad(set_to_none=True)
         loss = _fwd(data, mask)
@@ -292,22 +296,17 @@ def main(args, rank, local_rank, world_size):
 
         if step > 1:
             nvtx.range_pop()
+        if step == 2:
+            # dumping first 3 iterations from init are enough
+            # to include optimizer states. otherwise the .pkl becomes too big 
+            # and freezes chrome
+            # drag .pkl file to https://docs.pytorch.org/memory_viz
+            torch.cuda.memory._dump_snapshot(f"prof_memsnap_r{rank}.pkl")
         if step == 6:
             torch.cuda.cudart().cudaProfilerStop()
             prof.stop()
             prof.export_chrome_trace(f"prof_trace_r{rank}.json.gz")  # TODO: speedup gz
             prof.export_stacks(f"prof_stacks_cpu_r{rank}.txt")
-            torch.cuda.memory._dump_snapshot(f"prof_memsnap_r{rank}.pkl")
-            torch.cuda.memory._record_memory_history(enabled=None)
-            # Sometimes fails on gpu1...
-            try:
-                prof.export_memory_timeline(f"prof_memtl_r{rank}.html")
-                prof.export_memory_timeline(f"prof_memtl_r{rank}.json.gz")  # TODO: speedup gz
-                prof.export_memory_timeline(f"prof_memtl_r{rank}.raw.json.gz")
-            except ValueError:  # A bug for empty timeline?
-                import logging
-                logging.exception(f"Error exporting the memory timeline for rank {rank}")
-
         distr.barrier()  # Just for simplicity for now.
         printpg(model)
 
