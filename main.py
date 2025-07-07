@@ -1,9 +1,12 @@
 """
 pip install -U -r requirements.txt
 torchrun --nproc_per_node=gpu main.py
+
+To use ipdb instead, prepend `env PYTHONBREAKPOINT=ipdb.set_trace`
 """
 
 import argparse
+from datetime import datetime
 from functools import partial
 import itertools
 import os
@@ -18,15 +21,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.profiler import profile, record_function, ProfilerActivity
+from torch.utils.checkpoint import checkpoint
 
 import torch.cuda.nvtx as nvtx
 
 import simple_fsdp
 
 
-# start from the beginning to track every gpu memory allocation
-# otherwise we lost cpp tracestack for model initialization
-torch.cuda.memory._record_memory_history(max_entries=10000000)
+# 1: Compiled flex_attention is necessary to checkpoint the attention block, see:
+# https://github.com/pytorch/pytorch/issues/147879#issuecomment-3041193259
+# 2: max-autotune-no-cudagraphs takes a long time, but did 1039ms->1028ms on 4k seqlen.
+# cflex_attention = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs")
+cflex_attention = torch.compile(flex_attention)
+# cflex_attention = flex_attention
 
 
 class Attention(nn.Module):
@@ -49,9 +56,8 @@ class Attention(nn.Module):
         q = rearrange(self.q(x), "B T (Q D) -> B Q T D", Q=self.n_q_heads)
         k = rearrange(self.k(x), "B T (K D) -> B K T D", K=self.n_kv_heads)
         v = rearrange(self.v(x), "B T (V D) -> B V T D", V=self.n_kv_heads)
-        # NOTE: I tried compiling only flex_attention with max-autotune-no-cudagraphs, but no difference.
-        x = flex_attention(q, k, v, block_mask=mask,  # NB: scaled by 1/sqrt if scale=None, the default
-                           enable_gqa=self.n_q_heads != self.n_kv_heads)
+        x = cflex_attention(q, k, v, block_mask=mask,  # NB: scaled by 1/sqrt if scale=None, the default
+                            enable_gqa=self.n_q_heads != self.n_kv_heads)
         o = self.o(rearrange(x, "B Q T D -> B T (Q D)"))
         return o
 
@@ -95,8 +101,10 @@ class Block(nn.Module):
 
     @record_function("Block")
     def forward(self, x, mask):
-        x = x + self.att(self.att_ln(x), mask)
-        x = x + self.mlp(self.mlp_ln(x))
+        x = x + checkpoint(self.att, self.att_ln(x), mask, use_reentrant=False)
+        # x = x + self.att(self.att_ln(x), mask)
+        x = x + checkpoint(self.mlp, self.mlp_ln(x), use_reentrant=False)
+        # x = x + self.mlp(self.mlp_ln(x))
         return x
 
     def init_weights(self):
@@ -140,6 +148,7 @@ class SimpleTransformer(nn.Module):
         x = self.posemb(x, positions)
         for blk in self.blocks:
             x = blk(x, mask)
+            # x = checkpoint(blk, x, mask, use_reentrant=False)
         x = self.ln(x)
         x = self.head(x)
         return x
@@ -154,12 +163,166 @@ class SimpleTransformer(nn.Module):
             block.init_weights()
 
 
+def main(args, rank, local_rank, world_size):
+    printmem = partial(print_mem, verbosity=args.verbose, rank=rank)
+    printpg = partial(print_pg, verbosity=args.verbose, rank=rank)
+    prints = partial(print_stamped, rank=rank)
+    prints(f"Running with arguments: {args}")
+
+    # start from the beginning to track every gpu memory allocation
+    # otherwise we lost cpp tracestack for model initialization
+    torch.cuda.memory._record_memory_history(max_entries=10000000)
+
+    # In theory we only need `init_device_mesh`, but in practice, we need this
+    # whole verbose `init_process_group` or else the `barrier` will throw a warning.
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    distr.init_process_group("nccl", rank=rank, world_size=world_size, device_id=device)
+    mesh = distr.device_mesh.init_device_mesh(
+        "cuda", mesh_shape=(world_size,), mesh_dim_names=("dp",)  # Add "tp" for 2d parallel
+    )
+    printmem("at init")
+
+    # Later I want to do the "meta" device thing to never materialize full params.
+    with torch.device("meta"):
+        model = SimpleTransformer(dim=args.width, depth=args.depth, kv_reduce=4)
+    printmem("model(device=meta)")
+
+    model = simple_fsdp.data_parallel(
+        model, mesh,
+        mode="fully_shard",
+        ac_mode="full",  # Really just "none" (default) or not "none".
+        mp_policy=simple_fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16),
+        min_bytes=1024*1024,  # Don't shard params that are less than 1MiB
+    )
+    printmem("data_parallel(model)")
+
+    # Just checkin bruv
+    for name, tensor in itertools.chain(model.named_parameters(), model.named_buffers()):
+        assert tensor.device == torch.device("meta")
+
+    # Allocate buffers and sharded parameters on GPU
+    model.to_empty(device=torch.cuda.current_device())
+    printmem("model.to_empty(cuda)")
+
+    # Run user-defined initializers
+    with torch.no_grad():
+      with simple_fsdp.disable_data_parallel():  # super important, otherwise nothing happens.
+        model.init_weights() # or `model.apply(init_weights)`
+        if rank == 0:
+            summary_table(model, stats=False)
+    printmem("model.init_weights")
+    printpg(model)
+
+    # NOTE: I've seen this in torchtitan, but it doesn't have any effect for me yet
+    # torch._inductor.config.reorder_for_peak_memory = False  # Seen https://github.com/pytorch/torchtitan/blob/d9cc6b4df341eec27768b5ab9cead87ef595dbc2/torchtitan/experiments/simple_fsdp/parallelize.py#L96
+    # NOTE: o3 recommended this in combination with checkpointing, but I see no effect.
+    # torch._dynamo.config.optimize_ddp = False
+
+    # NOTE: Optimizer doesn't alloc here, only allocs on `.step()`.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    printmem("optimizer(params)")
+    vocab_size = model.emb.num_embeddings
+
+    if True:
+        @record_function("fwd")
+        @torch.compile
+        def _fwd(batch, mask):
+            logits = model(batch, mask)
+            return F.cross_entropy(logits.view(-1, vocab_size), data.view(-1))
+
+        @record_function("bwd")
+        @torch.compile
+        def _bwd(loss):
+            loss.backward()
+            optimizer.step()
+            return loss
+    else:
+        model = torch.compile(model)
+        def _fwd(batch, mask):
+            logits = model(batch, mask)
+            return F.cross_entropy(logits.view(-1, vocab_size), data.view(-1))
+        def _bwd(loss):
+            loss.backward()
+            optimizer.step()
+            return loss
+
+    # Let's overfit on a single batch, and also exclude this from timing.
+    # NOTE: Currently it's not data-parallel: each process(gpu) makes a batch.
+    data = torch.randint(0, vocab_size, (args.batch, args.seqlen), device="cuda")
+    printmem("data")
+
+    def causal_mask_mod(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+    mask = create_block_mask(causal_mask_mod, data.size(0), None, args.seqlen, args.seqlen)
+    printmem("mask")
+
+    peak_mems = []
+    step_times = []
+    prof = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=False,  # Done with torch.cuda functions instead.
+        with_stack=True,
+        with_flops=True,
+        with_modules=True,
+    )
+
+    for step in range(16):
+        t0 = time.perf_counter()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        if step > 1:
+            nvtx.range_push("step")
+        if step == 2:
+            torch.cuda.cudart().cudaProfilerStart()
+            prof.start()
+
+        model.zero_grad(set_to_none=True)
+        loss = _fwd(data, mask)
+        _bwd(loss)
+        prints(f"step {step}: loss {loss.item():.2f}")  # Causes a transfer.
+
+        torch.cuda.synchronize()
+        step_times.append((time.perf_counter() - t0) * 1000)  # ms
+        peak_mems.append(torch.cuda.max_memory_allocated() / 1024**2)  # MiB
+
+        if step > 1:
+            nvtx.range_pop()
+        if step == 2:
+            # dumping first 3 iterations from init are enough to include optimizer states.
+            # Otherwise the .pkl becomes too big and freezes chrome.
+            # Drag .pkl file to https://docs.pytorch.org/memory_viz
+            torch.cuda.memory._dump_snapshot(f"prof_memsnap_r{rank}.pkl")
+        if step == 6:
+            torch.cuda.cudart().cudaProfilerStop()
+            prof.stop()
+            prof.export_chrome_trace(f"prof_trace_r{rank}.json.gz")  # TODO: speedup gz
+            prof.export_stacks(f"prof_stacks_cpu_r{rank}.txt")
+        distr.barrier()  # Just for simplicity for now.
+        printpg(model)
+
+    prints(f"Peak mems (med: {np.median(peak_mems):.1f}MiB): {' '.join(f'{t:.0f}' for t in peak_mems)}")
+    prints(f"Step times (med: {np.median(step_times):.1f}ms): {' '.join(f'{t:.0f}' for t in step_times)}")
+    torch._dynamo.reset()  # Avoid hang: https://x.com/main_horse/status/1937900381574717940
+    distr.destroy_process_group()
+    prints(f"Destroyed group")
+
+
+###############
+# UTILS BELOW #
+###############
+def print_stamped(s, *a, rank, **kw):
+    t = datetime.now().time().isoformat(timespec='milliseconds')
+    print(f"[{rank} {t}] {s}", *a, **kw)
+
+
 def print_mem(name, verbosity=1, rank=0):
     if verbosity < 1: return
 
     torch.cuda.synchronize()
     if rank == 0:
-        print(f"Mem {name}: {torch.cuda.max_memory_allocated() / 1024**2:.2f}MiB", flush=True)
+        print_stamped(f"Mem {name}: {torch.cuda.max_memory_allocated() / 1024**2:.2f}MiB", rank=rank, flush=True)
 
 
 def global_normf(x):
@@ -188,133 +351,50 @@ def print_pg(model, verbosity=2, rank=0, file=sys.stderr):
     torch.cuda.synchronize()
     distr.barrier()
     for name, param in model.named_parameters():
-        print(f"[{rank}] {name:>22s}: ‖p‖={global_norms(param)} ‖∇‖={global_norms(param.grad)}", file=file)
+        print_stamped(f"{name:>22s}: ‖p‖={global_norms(param)} ‖∇‖={global_norms(param.grad)}", rank=rank, file=file)
 
 
-def main(args, rank, local_rank, world_size):
-    printmem = partial(print_mem, verbosity=args.verbose, rank=rank)
-    printpg = partial(print_pg, verbosity=args.verbose, rank=rank)
+def swissnum(x):
+    return f"{x:_}".replace("_", "'")
 
-    # In theory we only need `init_device_mesh`, but in practice, we need this
-    # whole verbose `init_process_group` or else the `barrier` will throw a warning.
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
-    distr.init_process_group("nccl", rank=rank, world_size=world_size, device_id=device)
-    mesh = distr.device_mesh.init_device_mesh(
-        "cuda", mesh_shape=(world_size,), mesh_dim_names=("dp",)  # Add "tp" for 2d parallel
-    )
-    printmem("at init")
 
-    # Later I want to do the "meta" device thing to never materialize full params.
-    with torch.device("meta"):
-        model = SimpleTransformer(dim=4096, depth=4, kv_reduce=4)
-    printmem("model(device=meta)")
+def summary_table(model, stats=True):
+    import rich
+    from rich.table import Table
 
-    model = simple_fsdp.data_parallel(
-        model, mesh,
-        mode="fully_shard",
-        ac_mode="full",  # Really just "none" (default) or not "none".
-        mp_policy=simple_fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16),
-    )
-    printmem("data_parallel(model)")
+    tbl = Table(show_header=True, header_style="bold magenta",
+                show_footer=True, footer_style="bold magenta",
+                box=rich.box.HORIZONTALS)
+    tbl.add_column("name", justify="left")
+    tbl.add_column("shape", justify="right")
+    tbl.add_column("dtype", justify="right")
+    tbl.add_column("params", justify="right")
+    tbl.add_column("placement", justify="right")
+    if stats:
+        tbl.add_column("mean", justify="right")
+        tbl.add_column("std", justify="right")
 
-    # Just checkin bruv
-    for tensor in itertools.chain(model.parameters(), model.buffers()):
-        assert tensor.device == torch.device("meta")
+    total_num, total_bytes = 0, 0
+    for name, x in itertools.chain(model.named_parameters(), model.named_buffers()):
+        total_num += x.numel()
+        total_bytes += x.nbytes
+        cols = [name]
+        cols += [str(tuple(x.shape))]
+        cols += [str(x.dtype)[len("torch."):]]
+        cols += [swissnum(x.numel())]
+        if hasattr(x, "placements"):
+            cols += [str(x.placements)]
+            # TODO: not sure why here x.to_local().shape == x.shape and
+            #       I can't get the shard's shape??
+        else:
+            cols += ["-"]
+        if stats:
+            cols += [x.mean(), x.std()]
+        tbl.add_row(*cols)
 
-    # Allocate buffers and sharded parameters on GPU
-    model.to_empty(device=torch.cuda.current_device())
-    printmem("model.to_empty(cuda)")
-
-    # Run user-defined initializers
-    with torch.no_grad():
-      with simple_fsdp.disable_data_parallel():  # super important, otherwise nothing happens.
-        model.init_weights() # or `model.apply(init_weights)`
-    printmem("model.init_weights")
-    printpg(model)
-
-    # NOTE: I've seen this in torchtitan, but it doesn't have any effect for me yet
-    torch._inductor.config.reorder_for_peak_memory = False  # Seen https://github.com/pytorch/torchtitan/blob/d9cc6b4df341eec27768b5ab9cead87ef595dbc2/torchtitan/experiments/simple_fsdp/parallelize.py#L96
-
-    # NOTE: Optimizer doesn't alloc here, only allocs on `.step()`.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    printmem("optimizer(params)")
-    vocab_size = model.emb.num_embeddings
-    seq_len = 4096
-
-    @record_function("fwd")
-    @torch.compile
-    def _fwd(batch, mask):
-        logits = model(batch, mask)
-        return F.cross_entropy(logits.view(-1, vocab_size), data.view(-1))
-
-    @record_function("bwd")
-    @torch.compile
-    def _bwd(loss):
-        loss.backward()
-        optimizer.step()
-        return loss
-
-    # Let's overfit on a single batch, and also exclude this from timing.
-    data = torch.randint(0, vocab_size, (8, seq_len), device="cuda")
-    printmem("data")
-
-    def causal_mask_mod(b, h, q_idx, kv_idx):
-        return q_idx >= kv_idx
-    mask = create_block_mask(causal_mask_mod, data.size(0), None, seq_len, seq_len)
-    printmem("mask")
-
-    peak_mems = []
-    step_times = []
-    prof = profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-        with_flops=True,
-        with_modules=True,
-    )
-
-    for step in range(16):
-        t0 = time.perf_counter()
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
-        if step > 1:
-            nvtx.range_push("step")
-        if step == 2:
-            torch.cuda.cudart().cudaProfilerStart()
-            prof.start()
-
-        model.zero_grad(set_to_none=True)
-        loss = _fwd(data, mask)
-        _bwd(loss)
-        print(f"[{rank}] step {step}: loss {loss.item():.2f}")  # Causes a transfer. TODO: avg globally.
-
-        torch.cuda.synchronize()
-        step_times.append((time.perf_counter() - t0) * 1000)  # ms
-        peak_mems.append(torch.cuda.max_memory_allocated() / 1024**2)  # MiB
-
-        if step > 1:
-            nvtx.range_pop()
-        if step == 2:
-            # dumping first 3 iterations from init are enough
-            # to include optimizer states. otherwise the .pkl becomes too big 
-            # and freezes chrome
-            # drag .pkl file to https://docs.pytorch.org/memory_viz
-            torch.cuda.memory._dump_snapshot(f"prof_memsnap_r{rank}.pkl")
-        if step == 6:
-            torch.cuda.cudart().cudaProfilerStop()
-            prof.stop()
-            prof.export_chrome_trace(f"prof_trace_r{rank}.json.gz")  # TODO: speedup gz
-            prof.export_stacks(f"prof_stacks_cpu_r{rank}.txt")
-        distr.barrier()  # Just for simplicity for now.
-        printpg(model)
-
-    print(f"[{rank}] Peak mems (med: {np.median(peak_mems):.1f}MiB): {' '.join(f'{t:.0f}' for t in peak_mems)}")
-    print(f"[{rank}] Step times (med: {np.median(step_times):.1f}ms): {' '.join(f'{t:.0f}' for t in step_times)}")
-    torch._dynamo.reset()  # Avoid hang: https://x.com/main_horse/status/1937900381574717940
-    distr.destroy_process_group()
-    print(f"[{rank}] Destroyed group")
+    tbl.columns[0].footer = f"Total: {swissnum(total_num)}"
+    tbl.columns[1].footer = f"({total_bytes/1024/1024:.0f}MiB)"
+    rich.print(tbl)
 
 
 if __name__ == "__main__":
@@ -323,6 +403,14 @@ if __name__ == "__main__":
     world_size = int(os.environ["WORLD_SIZE"])
 
     parser = argparse.ArgumentParser(description="iykyk")
+    parser.add_argument("-b", "--batch", type=int, default=8,
+                        help="Per-device batch-size.")
+    parser.add_argument("-s", "--seqlen", type=int, default=4096,
+                        help="Sequence length in tokens.")
+    parser.add_argument("-d", "--depth", type=int, default=4,
+                        help="Depth of the model, in blocks.")
+    parser.add_argument("-w", "--width", type=int, default=4096,
+                        help="Width of the model, aka d_model.")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v: print memory and timings. -vv: Also print expensive details like gradnorms.")
     args = parser.parse_args()

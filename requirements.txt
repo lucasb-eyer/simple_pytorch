@@ -2,3 +2,5 @@
 einops
 numpy
 matplotlib
+ipdb
+rich

@@ -138,10 +138,8 @@ def _register_parametrization(
     get_model_state_dict func in torchtitan's torchtitan/components/checkpoint.py.
     """
     param_name_to_property = {
-        param_name: property(
-            lambda self, pn=param_name: parametrization(self._parameters[pn])
-        )
-        for param_name in param_names
+        pname: property(lambda self, pn=pname: parametrization(self._parameters[pn]))
+        for pname in param_names
     }
     module_cls = type(
         f"FSDP{module.__class__.__name__}",
@@ -172,15 +170,14 @@ def fsdp_policy():
 
 class ReplicateComputation(torch.nn.Module):
     def __init__(
-        self, device_mesh, param_sharding, mode, regional_ac, mp_policy, tp_mesh
+        self, device_mesh, param_sharding, checkpoint, mp_policy, tp_mesh
     ):
         super().__init__()
         self.device_mesh = device_mesh
         self.param_sharding = param_sharding
-        self.mode = mode
         self.compute_placements = [Replicate()] * self.device_mesh.ndim
         self.grad_placements = [Partial(reduce_op="avg")] * self.device_mesh.ndim
-        self.regional_ac = regional_ac
+        self.checkpoint = checkpoint
         mp_policy = mp_policy or MixedPrecisionPolicy()
         self.param_dtype = mp_policy.param_dtype
         self.reduce_dtype = mp_policy.reduce_dtype
@@ -240,7 +237,7 @@ class ReplicateComputation(torch.nn.Module):
         if not _active_parametrization:
             return x
 
-        if self.regional_ac and self.mode in ("fully_shard", "hybrid_shard"):
+        if self.checkpoint:
             # apply checkpointing to implement reshard_after_forward
             output = checkpoint(
                 self.replicate_compute, x, use_reentrant=False, context_fn=fsdp_policy
@@ -258,64 +255,51 @@ def data_parallel(
     ac_mode: str = "none",
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     tp_mesh: Optional[DeviceMesh] = None,
+    min_bytes: int = 0,
 ):
-    if mode == "replicate":
-        param_sharding = (Replicate(),)
-    elif mode == "fully_shard":
-        param_sharding = (Shard(0),)
-    elif mode == "hybrid_shard":
-        # replicate inter-host, fully shard intra-host
-        param_sharding = (Replicate(), Shard(0))
+    if mode == "hybrid_shard":
         assert (
             device_mesh.ndim == 2
         ), "hybrid sharded data parallel requires 2D DeviceMesh"
     else:
-        raise ValueError(f"Unsupported mode {mode}")
-
-    modules = list(model.modules())
+        assert mode in ("fully_shard", "replicate"), f"Unsupported mode {mode}"
 
     # apply regional ac (with fsdp_policy) if no global ac is to be applied
     regional_ac = ac_mode == "none"
 
-    for mod in modules:
-        params_dict = dict(mod.named_parameters(recurse=False))
-        for p_name, p in params_dict.items():
-            if p is not None and p.numel() > 0:
-                distribute_tensor_func = (
-                    _distribute_dtensor if isinstance(p, DTensor) else distribute_tensor
-                )
-                mod.register_parameter(
-                    p_name,
-                    nn.Parameter(
-                        distribute_tensor_func(p, device_mesh, param_sharding)
-                    ),
-                )
-                # to be compatible with DCP, we use a customized _register_parametrization
-                # instead of nn.utils.parametrize.register_parametrization here
-                # nn.utils.parametrize.register_parametrization(
-                #     mod,
-                #     p_name,
-                #     ReplicateComputation(
-                #         device_mesh,
-                #         param_sharding,
-                #         mode,
-                #         regional_ac,
-                #         mp_policy=mp_policy,
-                #         tp_mesh=tp_mesh,
-                #     ),
-                #     unsafe=True,
-                # )
+    for mod in list(model.modules()):
+        for p_name, p in mod.named_parameters(recurse=False):
+            if p is None: continue
 
-        _register_parametrization(
-            mod,
-            list(params_dict.keys()),
-            ReplicateComputation(
-                device_mesh,
-                param_sharding,
-                mode,
-                regional_ac,
-                mp_policy=mp_policy,
-                tp_mesh=tp_mesh,
-            ),
-        )
+            if mode == "hybrid_shard":
+                # replicate inter-host, fully shard intra-host
+                p_sharding = (Replicate(), Shard(0))
+                p_ckpt = regional_ac
+            elif mode == "fully_shard" and p.nbytes >= min_bytes:
+                p_sharding = (Shard(0),)
+                p_ckpt = regional_ac
+            else:
+                p_sharding = (Replicate(),)
+                p_ckpt = False
+
+            distribute_tensor_func = (
+                _distribute_dtensor if isinstance(p, DTensor) else distribute_tensor
+            )
+            mod.register_parameter(
+                p_name,
+                nn.Parameter(
+                    distribute_tensor_func(p, device_mesh, p_sharding)
+                ),
+            )
+            # to be compatible with DCP, we use a customized _register_parametrization
+            # instead of nn.utils.parametrize.register_parametrization here
+            _register_parametrization(
+                mod, [p_name], ReplicateComputation(
+                    device_mesh,
+                    p_sharding,
+                    p_ckpt,
+                    mp_policy=mp_policy,
+                    tp_mesh=tp_mesh,
+                ),
+            )
     return model
