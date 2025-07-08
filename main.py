@@ -79,9 +79,9 @@ class Attention(nn.Module):
 
     def useful_flops(self, x, mask):
         t = x.shape[1]
-        linears = 4 * 6 * self.dim**2  # 4 linears, 6 flops per linear, all are dim²
-        qk = 3 * 2 * self.dim * t / 2  # The param-free QK' mul. (dim=head_dim * q_heads)
-        av = 3 * 2 * self.dim * t / 2  # The param-free attention-value mul.
+        linears = 4 * 6 * self.dim**2 * t  # 4 linears, 6 flops per linear, all are dim²
+        qk = 3 * 2 * self.dim * t * t / 2  # The param-free QK' mul. (dim=head_dim * q_heads)
+        av = 3 * 2 * self.dim * t * t / 2  # The param-free attention-value mul.
         # TODO: t/2 because for now assuming causal mask. In the future: check!
         return linears + qk + av
 
