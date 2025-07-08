@@ -28,6 +28,15 @@ import torch.cuda.nvtx as nvtx
 import simple_fsdp
 
 
+# Allow using the (lower-precision) tensorcores for all fp32 matmuls.
+# See https://docs.pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices
+# torch.backends.fp32_precision = "tf32"
+# SOMETHING in torch compile uses the old API, forcing us to use that too:
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# But on a quick try it did make no diff?
+
+
 # 1: Compiled flex_attention is necessary to checkpoint the attention block, see:
 # https://github.com/pytorch/pytorch/issues/147879#issuecomment-3041193259
 # 2: max-autotune-no-cudagraphs takes a long time, but did 1039ms->1028ms on 4k seqlen.
@@ -68,6 +77,14 @@ class Attention(nn.Module):
         nn.init.trunc_normal_(self.v.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.o.weight, mean=0.0, std=1/np.sqrt(self.dim))  # TODO: carefully
 
+    def useful_flops(self, x, mask):
+        t = x.shape[1]
+        linears = 4 * 6 * self.dim**2  # 4 linears, 6 flops per linear, all are dim²
+        qk = 3 * 2 * self.dim * t / 2  # The param-free QK' mul. (dim=head_dim * q_heads)
+        av = 3 * 2 * self.dim * t / 2  # The param-free attention-value mul.
+        # TODO: t/2 because for now assuming causal mask. In the future: check!
+        return linears + qk + av
+
 
 class MLP(nn.Module):
     def __init__(self, dim, grow=4):
@@ -89,6 +106,11 @@ class MLP(nn.Module):
         nn.init.trunc_normal_(self.l2.weight, mean=0.0, std=1/np.sqrt(self.dim * self.grow / 2))
         nn.init.zeros_(self.l1.bias)
         nn.init.zeros_(self.l2.bias)
+
+    def useful_flops(self, x):
+        # 6 = 2 flops per mac * (1 fwd + 2 bwd)
+        per_token = 6 * (self.dim * self.grow) + 6 * (self.grow * self.dim)
+        return x.shape[1] * per_token
 
 
 class Block(nn.Module):
@@ -112,6 +134,9 @@ class Block(nn.Module):
         self.mlp.init_weights()
         self.att_ln.reset_parameters()
         self.mlp_ln.reset_parameters()
+
+    def useful_flops(self, x, mask):
+        return self.att.useful_flops(x, mask) + self.mlp.useful_flops(x)
 
 
 class SinCosPosEmb(nn.Module):
@@ -162,6 +187,12 @@ class SimpleTransformer(nn.Module):
         for block in self.blocks:
             block.init_weights()
 
+    def useful_flops(self, x, mask, positions=None):
+        # emb and posemb are trivial, skipping.
+        ret = sum(blk.useful_flops(x, mask) for blk in self.blocks)
+        # Add the output head matmul flop count.
+        ret += 6 * x.shape[1] * np.prod(self.head.weight.shape)
+        return ret
 
 def main(args, rank, local_rank, world_size):
     printmem = partial(print_mem, verbosity=args.verbose, rank=rank)
@@ -185,13 +216,14 @@ def main(args, rank, local_rank, world_size):
 
     # Later I want to do the "meta" device thing to never materialize full params.
     with torch.device("meta"):
-        model = SimpleTransformer(dim=args.width, depth=args.depth, kv_reduce=4)
+        model = SimpleTransformer(dim=args.width, depth=args.depth, kv_reduce=args.grouping)
     printmem("model(device=meta)")
 
     model = simple_fsdp.data_parallel(
         model, mesh,
         mode="fully_shard",
-        ac_mode="full",  # Really just "none" (default) or not "none".
+        # mode="replicate",
+        # ac_mode="full",  # Really just "none" (default) or not "none".
         mp_policy=simple_fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16),
         min_bytes=1024*1024,  # Don't shard params that are less than 1MiB
     )
@@ -220,7 +252,7 @@ def main(args, rank, local_rank, world_size):
     # torch._dynamo.config.optimize_ddp = False
 
     # NOTE: Optimizer doesn't alloc here, only allocs on `.step()`.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
     printmem("optimizer(params)")
     vocab_size = model.emb.num_embeddings
 
@@ -228,6 +260,7 @@ def main(args, rank, local_rank, world_size):
         @record_function("fwd")
         @torch.compile
         def _fwd(batch, mask):
+          # with torch.amp.autocast("cuda", dtype=torch.bfloat16):   # casts inputs & ops
             logits = model(batch, mask)
             return F.cross_entropy(logits.view(-1, vocab_size), data.view(-1))
 
@@ -299,6 +332,11 @@ def main(args, rank, local_rank, world_size):
             prof.stop()
             prof.export_chrome_trace(f"prof_trace_r{rank}.json.gz")  # TODO: speedup gz
             prof.export_stacks(f"prof_stacks_cpu_r{rank}.txt")
+        if step == 7:
+            flops_per_example = model.useful_flops(data, mask)
+            achieved = flops_per_example * data.shape[0] / (step_times[-1] / 1000)
+            prints(f"MFU: {achieved / get_peak_flops():.1%} (={achieved/1e12:.0f}TFLOPs / {get_peak_flops()/1e12:.0f} peak)")
+
         distr.barrier()  # Just for simplicity for now.
         printpg(model)
 
@@ -397,6 +435,31 @@ def summary_table(model, stats=True):
     rich.print(tbl)
 
 
+# Partially taken from torchtitan
+def get_peak_flops(device_name=None, dtype="bf16"):
+    if not device_name:
+        device_name = torch.cuda.get_device_name()
+
+    if "A100" in device_name:
+        assert dtype == "bf16"
+        # data from https://www.nvidia.com/en-us/data-center/a100/
+        return 312e12
+    elif "H100" in device_name:
+        # data from https://www.nvidia.com/en-us/data-center/h100/
+        # NOTE: Specifications are one-half lower without sparsity.
+        if "NVL" in device_name:
+            # NOTE: numbers I found there differs from torchtitan?! TT: 1979e12
+            return {"bf16": 1671e12/2, "fp8": 3341e12/2}[dtype]
+        elif "PCIe" in device_name:
+            # Also: https://www.colfax-intl.com/nvidia/nvidia-h100
+            return {"bf16": 756e12, "fp8": 3026e12/2}[dtype]
+        else:  # for SXM and other variants
+            return {"bf16": 989e12, "fp8": 3958e12/2}[dtype]
+    else:
+        print(f"Warning: no peak flops info for {device_name}, MFU will be wrong.")
+        return 312e12
+
+
 if __name__ == "__main__":
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -411,6 +474,8 @@ if __name__ == "__main__":
                         help="Depth of the model, in blocks.")
     parser.add_argument("-w", "--width", type=int, default=4096,
                         help="Width of the model, aka d_model.")
+    parser.add_argument("-g", "--grouping", type=int, default=4,
+                        help="Reduction factor for GQA (1=MHA)")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v: print memory and timings. -vv: Also print expensive details like gradnorms.")
     args = parser.parse_args()
