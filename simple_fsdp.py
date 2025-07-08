@@ -252,7 +252,7 @@ def data_parallel(
     model,
     device_mesh,
     mode="replicate",
-    ac_mode: str = "none",
+    need_ac: bool = True,  # Set to False if you already do AC.
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     tp_mesh: Optional[DeviceMesh] = None,
     min_bytes: int = 0,
@@ -264,9 +264,6 @@ def data_parallel(
     else:
         assert mode in ("fully_shard", "replicate"), f"Unsupported mode {mode}"
 
-    # apply regional ac (with fsdp_policy) if no global ac is to be applied
-    regional_ac = ac_mode == "none"
-
     for mod in list(model.modules()):
         for p_name, p in mod.named_parameters(recurse=False):
             if p is None: continue
@@ -274,10 +271,10 @@ def data_parallel(
             if mode == "hybrid_shard":
                 # replicate inter-host, fully shard intra-host
                 p_sharding = (Replicate(), Shard(0))
-                p_ckpt = regional_ac
+                p_ckpt = need_ac
             elif mode == "fully_shard" and p.nbytes >= min_bytes:
                 p_sharding = (Shard(0),)
-                p_ckpt = regional_ac
+                p_ckpt = need_ac
             else:
                 p_sharding = (Replicate(),)
                 p_ckpt = False

@@ -223,7 +223,7 @@ def main(args, rank, local_rank, world_size):
         model, mesh,
         mode="fully_shard",
         # mode="replicate",
-        # ac_mode="full",  # Really just "none" (default) or not "none".
+        need_ac=False,  # We're already doing AC for most model pieces.
         mp_policy=simple_fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16),
         min_bytes=1024*1024,  # Don't shard params that are less than 1MiB
     )
