@@ -36,6 +36,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 # But on a quick try it did make no diff?
 
+# Reduce limit to make the issue appear faster
+# torch._dynamo.config.recompile_limit = 1
+
 
 # 1: Compiled flex_attention is necessary to checkpoint the attention block, see:
 # https://github.com/pytorch/pytorch/issues/147879#issuecomment-3041193259
@@ -124,19 +127,16 @@ class Block(nn.Module):
         self.mlp_ln = nn.LayerNorm(dim)
         self.att = Attention(dim, head_dim, kv_reduce)
         self.mlp = MLP(dim, grow)
-
-        # NOTE: I can't assign to `self.att` because nn.Module special-cases.
-        if remat:
-            self.att_fn = partial(checkpoint, self.att, use_reentrant=False)
-            self.mlp_fn = partial(checkpoint, self.mlp, use_reentrant=False)
-        else:
-            self.att_fn = lambda *a, **kw: self.att(*a, **kw)
-            self.mlp_fn = lambda *a, **kw: self.mlp(*a, **kw)
+        self.remat = remat
 
     @record_function("Block")
     def forward(self, x, mask):
-        x = x + self.att_fn(self.att_ln(x), mask)
-        x = x + self.mlp_fn(self.mlp_ln(x))
+        if self.remat:
+            x = x + checkpoint(lambda y, mask: self.att(self.att_ln(y), mask), x, mask, use_reentrant=False)
+            x = x + checkpoint(lambda y: self.mlp(self.mlp_ln(y)), x, use_reentrant=False)
+        else:
+            x = x + self.att(self.att_ln(x), mask)
+            x = x + self.mlp(self.mlp_ln(x))
         return x
 
     def init_weights(self):
