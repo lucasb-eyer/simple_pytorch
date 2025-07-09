@@ -85,6 +85,8 @@ class Attention(nn.Module):
         qk = 3 * 2 * self.dim * t * t / 2  # The param-free QK' mul. (dim=head_dim * q_heads)
         av = 3 * 2 * self.dim * t * t / 2  # The param-free attention-value mul.
         # TODO: t/2 because for now assuming causal mask. In the future: check!
+        # NOTE: Most PyTorch codebases don't do this and omit the /2, thus being too optimistic.
+        #       Removing gives ~ +5%. They do it for bwd compat reasons.
         return linears + qk + av
 
 
