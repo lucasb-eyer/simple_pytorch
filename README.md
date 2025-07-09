@@ -175,10 +175,38 @@ And even on bad interconnect, it seems to be a bad idea: it's actually slower?!
 
 I don't think it makes sense for replicated to _ever_ be slower though, so maybe I'm doing something wrong.
 
+### MFU
+
+With the default setting from above unless stated otherwise:
+
+| A100's | attn | seqlen | depth | remat | gqa | MFU% |
+|--------|------|--------|-------|-------|-----|------|
+|   4    | flex |  4096  |   4   |  yes  |  4  | 26.0 |
+|   4    | flex |  4096  |   8   |  yes  |  4  | 23.7 |
+|   4    | flex |  4096  |   4   |   no  |  4  | 29.5 |
+|   4    | flex |   512  |   4   |  yes  |  4  | 20.0 |
+|   4    | flex |  4096  |   4   |  yes  |  1  | 24.3 |
+|   .    |   .  |    .   |   .   |   .   |  .  |   .  |
+|   4    | spda |  4096  |   4   |  yes  |  4  | 30.5 |
+|   4    | spda |  4096  |   8   |  yes  |  4  | 28.8 |
+|   4    | spda |  4096  |   4   |   no  |  4  | 35.3 |
+|   4    | spda |   512  |   4   |  yes  |  4  | 20.8 |
+|   4    | spda |  4096  |   4   |  yes  |  1  | 28.0 |
+|   .    |   .  |    .   |   .   |   .   |  .  |   .  |
+|   1    | flex |  4096  |   4   |  yes  |  4  | 26.2 |
+|   2    | flex |  4096  |   4   |  yes  |  4  | 25.9 |
+|   4    | flex |  4096  |   4   |  yes  |  4  | 26.0 |
+
+Interestingly, using `mode=replicate` leads to lower MFU:
+30.4 for spda, 25.8 for flex,
+so that's something suspicious to look into at some point.
+
+
 # TODOs:
 
 - Multi-node speedtest.
 - Save/load model.
+- Why is `mode=replicate` slightly slower?
 - check out this warning when using d=12 or more:
 
 ```

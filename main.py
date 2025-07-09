@@ -67,6 +67,8 @@ class Attention(nn.Module):
         v = rearrange(self.v(x), "B T (V D) -> B V T D", V=self.n_kv_heads)
         x = cflex_attention(q, k, v, block_mask=mask,  # NB: scaled by 1/sqrt if scale=None, the default
                             enable_gqa=self.n_q_heads != self.n_kv_heads)
+        # x = F.scaled_dot_product_attention(  # NB: scaled by 1/sqrt by default
+        #     q, k, v, is_causal=True, enable_gqa=self.n_q_heads != self.n_kv_heads)
         o = self.o(rearrange(x, "B Q T D -> B T (Q D)"))
         return o
 
@@ -114,19 +116,25 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, head_dim=128, grow=4, kv_reduce=4):
+    def __init__(self, dim, head_dim=128, grow=4, kv_reduce=4, remat=True):
         super().__init__()
         self.att_ln = nn.LayerNorm(dim)  # TODO: better ln parametrization
         self.mlp_ln = nn.LayerNorm(dim)
         self.att = Attention(dim, head_dim, kv_reduce)
         self.mlp = MLP(dim, grow)
 
+        # NOTE: I can't assign to `self.att` because nn.Module special-cases.
+        if remat:
+            self.att_fn = partial(checkpoint, self.att, use_reentrant=False)
+            self.mlp_fn = partial(checkpoint, self.mlp, use_reentrant=False)
+        else:
+            self.att_fn = lambda *a, **kw: self.att(*a, **kw)
+            self.mlp_fn = lambda *a, **kw: self.mlp(*a, **kw)
+
     @record_function("Block")
     def forward(self, x, mask):
-        x = x + checkpoint(self.att, self.att_ln(x), mask, use_reentrant=False)
-        # x = x + self.att(self.att_ln(x), mask)
-        x = x + checkpoint(self.mlp, self.mlp_ln(x), use_reentrant=False)
-        # x = x + self.mlp(self.mlp_ln(x))
+        x = x + self.att_fn(self.att_ln(x), mask)
+        x = x + self.mlp_fn(self.mlp_ln(x))
         return x
 
     def init_weights(self):
@@ -157,11 +165,11 @@ class SinCosPosEmb(nn.Module):
 
 
 class SimpleTransformer(nn.Module):
-    def __init__(self, dim, depth, vocab=32_768, head_dim=128, grow=4, kv_reduce=4):
+    def __init__(self, dim, depth, vocab=32_768, **block_kw):
         super().__init__()
         self.emb = nn.Embedding(vocab, dim)
         self.posemb = SinCosPosEmb()
-        self.blocks = nn.ModuleList([Block(dim, head_dim, grow, kv_reduce) for _ in range(depth)])
+        self.blocks = nn.ModuleList([Block(dim, **block_kw) for _ in range(depth)])
         self.ln = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, vocab, bias=False)
 
@@ -216,14 +224,14 @@ def main(args, rank, local_rank, world_size):
 
     # Later I want to do the "meta" device thing to never materialize full params.
     with torch.device("meta"):
-        model = SimpleTransformer(dim=args.width, depth=args.depth, kv_reduce=args.grouping)
+        model = SimpleTransformer(dim=args.width, depth=args.depth, kv_reduce=args.grouping, remat=args.remat)
     printmem("model(device=meta)")
 
     model = simple_fsdp.data_parallel(
         model, mesh,
         mode="fully_shard",
         # mode="replicate",
-        need_ac=False,  # We're already doing AC for most model pieces.
+        need_ac=not args.remat,  # Only do FSDP's "remat" (of params/comms) if we don't already cover that ourselves.
         mp_policy=simple_fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16),
         min_bytes=1024*1024,  # Don't shard params that are less than 1MiB
     )
@@ -476,6 +484,9 @@ if __name__ == "__main__":
                         help="Width of the model, aka d_model.")
     parser.add_argument("-g", "--grouping", type=int, default=4,
                         help="Reduction factor for GQA (1=MHA)")
+    parser.add_argument("--no-remat", dest="remat", action="store_false",
+                        help="Disable rematerialization aka selective activation checkpointing.")
+    parser.set_defaults(remat=True)
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v: print memory and timings. -vv: Also print expensive details like gradnorms.")
     args = parser.parse_args()
