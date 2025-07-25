@@ -251,10 +251,10 @@ def main(args, rank, local_rank, world_size):
     with torch.no_grad():
       with simple_fsdp.disable_data_parallel():  # super important, otherwise nothing happens.
         model.init_weights() # or `model.apply(init_weights)`
-        if rank == 0:
-            summary_table(model, stats=False)
     printmem("model.init_weights")
     printpg(model)
+    if rank == 0:
+        summary_table(model, stats=False)
 
     # NOTE: I've seen this in torchtitan, but it doesn't have any effect for me yet
     # torch._inductor.config.reorder_for_peak_memory = False  # Seen https://github.com/pytorch/torchtitan/blob/d9cc6b4df341eec27768b5ab9cead87ef595dbc2/torchtitan/experiments/simple_fsdp/parallelize.py#L96
@@ -297,7 +297,7 @@ def main(args, rank, local_rank, world_size):
 
     def causal_mask_mod(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
-    mask = create_block_mask(causal_mask_mod, data.size(0), None, args.seqlen, args.seqlen)
+    mask = create_block_mask(causal_mask_mod, None, None, args.seqlen, args.seqlen)
     printmem("mask")
 
     peak_mems = []
@@ -418,11 +418,12 @@ def summary_table(model, stats=True):
     tbl.add_column("dtype", justify="right")
     tbl.add_column("params", justify="right")
     tbl.add_column("placement", justify="right")
+    tbl.add_column("local shape", justify="right")
     if stats:
         tbl.add_column("mean", justify="right")
         tbl.add_column("std", justify="right")
 
-    total_num, total_bytes = 0, 0
+    total_num, total_bytes, local_bytes = 0, 0, 0
     for name, x in itertools.chain(model.named_parameters(), model.named_buffers()):
         total_num += x.numel()
         total_bytes += x.nbytes
@@ -431,17 +432,17 @@ def summary_table(model, stats=True):
         cols += [str(x.dtype)[len("torch."):]]
         cols += [swissnum(x.numel())]
         if hasattr(x, "placements"):
-            cols += [str(x.placements)]
-            # TODO: not sure why here x.to_local().shape == x.shape and
-            #       I can't get the shard's shape??
+            cols += [str(x.placements), str(tuple(x.to_local().shape))]
+            local_bytes += x.to_local().nbytes
         else:
-            cols += ["-"]
+            cols += ["-", "shape"]
         if stats:
             cols += [x.mean(), x.std()]
         tbl.add_row(*cols)
 
     tbl.columns[0].footer = f"Total: {swissnum(total_num)}"
     tbl.columns[1].footer = f"({total_bytes/1024/1024:.0f}MiB)"
+    tbl.columns[2].footer = f"Local: {local_bytes/1024/1024:.0f}MiB"
     rich.print(tbl)
 
 
