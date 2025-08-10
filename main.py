@@ -116,7 +116,7 @@ class MLP(nn.Module):
 
     def useful_flops(self, x):
         # 6 = 2 flops per mac * (1 fwd + 2 bwd)
-        per_token = 6 * (self.dim * self.grow) + 6 * (self.grow * self.dim)
+        per_token = 6 * (self.dim * self.dim * self.grow) + 6 * (self.grow * self.dim * self.dim)
         return x.shape[1] * per_token
 
 
